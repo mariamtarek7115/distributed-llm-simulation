@@ -6,13 +6,12 @@ class LLMHandler:
         # Lightweight GPT-2 model (CPU-friendly)
         self.generator = pipeline("text-generation", model="gpt2")
 
-    def generate(self, prompt, context=""):
-        full_prompt = f"Context: {context}\nQuestion: {prompt}\nAnswer:"
+    def generate(self, prompt): 
+        # Esta5dm max_new_tokens badal max_length
+        result = self.generator(prompt, max_new_tokens=50, num_return_sequences=1) 
         
-        result = self.generator(
-            full_prompt,
-            max_length=50,
-            num_return_sequences=1
-        )
-
-        return result[0]["generated_text"]
+        # 3ashan n-extract el egeba el gedida bas w nesheel el prompt mn el output
+        generated_text = result[0]['generated_text']
+        answer_only = generated_text.replace(prompt, "").strip()
+        
+        return answer_only
