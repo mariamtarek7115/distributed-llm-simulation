@@ -20,8 +20,13 @@ class RAGRetriever:
         self.index = faiss.IndexFlatL2(self.embeddings.shape[1])
         self.index.add(self.embeddings)
 
-    def get_context(self, query, top_k=1):
-        # Search for the most relevant sentence
-        query_vector = self.model.encode([query])
-        distances, indices = self.index.search(query_vector, top_k)
-        return self.documents[indices[0][0]]
+    def get_context(self, query, top_k=2): # 5alena top_k=2 hena
+            # Search for the most relevant sentences
+            query_vector = self.model.encode([query])
+            distances, indices = self.index.search(query_vector, top_k)
+            
+            # Combine the retrieved documents into one context string
+            retrieved_docs = [self.documents[idx] for idx in indices[0]]
+            combined_context = " | ".join(retrieved_docs)
+            
+            return combined_context

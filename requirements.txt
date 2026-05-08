@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+transformers
+sentence-transformers
+faiss-cpu
+accelerate

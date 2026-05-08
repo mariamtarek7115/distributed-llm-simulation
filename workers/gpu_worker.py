@@ -19,7 +19,11 @@ def get_worker_id():
 WORKER_ID = f"Port-{get_worker_id()}"
 
 # ZERAR EL MOCKING: Khaly da True w enta bt-test el 1000 users, w False law 3ayez el AI be-gad
-MOCK_MODE = True 
+MOCK_MODE = False 
+
+@app.get("/health")
+async def health_check():
+    return {"status": "alive", "worker_id": WORKER_ID}
 
 @app.post("/process")
 async def process_request(request: dict):

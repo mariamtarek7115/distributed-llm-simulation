@@ -15,14 +15,14 @@ async def main():
     scheduler = Scheduler(lb)
     
     print("\n=== CSE354: Distributed LLM System ===")
-    print("1. Test Fault Tolerance (20 users)")
+    print("1. Test Fault Tolerance (100 users)")
     print("2. Stress Test (1000 users)")
     
     choice = input("Enter your choice (1 or 2): ")
     
     if choice == '1':
-        # Hanghrab 20 user bas, w n-limit el concurrency le 5 3ashan el test ytewal shwaya w n-l7a2 n-wa2a3 server
-        await run_load_test(scheduler, num_users=20, max_concurrent=5)
+        # Hanghrab 100 user bas, w n-limit el concurrency le 5 3ashan el test ytewal shwaya w n-l7a2 n-wa2a3 server
+        await run_load_test(scheduler, num_users=100, max_concurrent=5)
     elif choice == '2':
         # El stress test el kbeer 
         await run_load_test(scheduler, num_users=1000, max_concurrent=30)

@@ -5,8 +5,30 @@ class LoadBalancer:
     def __init__(self, worker_urls):
         self.worker_urls = worker_urls.copy()
         self.active_connections = {url: 0 for url in worker_urls}
-        self.dead_nodes = set() # N-keep track b el nodes elly wa23et
+        self.dead_nodes = set()
+        
+        # Start the background heartbeat task automatically
+        #asyncio.create_task(self.heartbeat_loop())
 
+    # --- THE NEW HEARTBEAT FUNCTION ---
+    async def heartbeat_loop(self):
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            while True:
+                await asyncio.sleep(5) # Check every 5 seconds
+                
+                # N-loop 3ala نسخة mn el dead_nodes 3shan hnghyar fiha
+                for dead_url in list(self.dead_nodes):
+                    try:
+                        # Try to ping the dead node
+                        response = await client.get(f"{dead_url}/health")
+                        if response.status_code == 200:
+                            print(f"✅ [RECOVERY] Node {dead_url} is back online!")
+                            self.dead_nodes.remove(dead_url)
+                            self.active_connections[dead_url] = 0 # Reset connections
+                    except:
+                        # Lsa mayet, mt3mlsh 7aga
+                        pass
+                    
     async def route_request(self, payload):
         # 1. Filter out dead nodes
         available_nodes = {url: req for url, req in self.active_connections.items() if url not in self.dead_nodes}
