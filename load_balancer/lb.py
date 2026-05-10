@@ -1,11 +1,15 @@
-import httpx
 import asyncio
+import time
+
+import httpx
 
 class LoadBalancer:
-    def __init__(self, worker_urls):
+    def __init__(self, worker_urls, backend="custom", model_name=None):
         self.worker_urls = worker_urls.copy()
         self.active_connections = {url: 0 for url in worker_urls}
         self.dead_nodes = set()
+        self.backend = backend
+        self.model_name = model_name
         
         # Start the background heartbeat task automatically
         #asyncio.create_task(self.heartbeat_loop())
@@ -20,7 +24,8 @@ class LoadBalancer:
                 for dead_url in list(self.dead_nodes):
                     try:
                         # Try to ping the dead node
-                        response = await client.get(f"{dead_url}/health")
+                        health_path = "/api/tags" if self.backend == "ollama" else "/health"
+                        response = await client.get(f"{dead_url}{health_path}")
                         if response.status_code == 200:
                             print(f"✅ [RECOVERY] Node {dead_url} is back online!")
                             self.dead_nodes.remove(dead_url)
@@ -41,9 +46,28 @@ class LoadBalancer:
         self.active_connections[target_url] += 1
         
         try:
+            request_started_at = time.time()
             # Send request
             async with httpx.AsyncClient(timeout=120.0) as client:
+                if self.backend == "ollama":
+                    response = await client.post(
+                        f"{target_url}/api/generate",
+                        json={
+                            "model": self.model_name,
+                            "prompt": payload["prompt"],
+                            "stream": False,
+                        },
+                    )
+                    response.raise_for_status()
+                    response_payload = response.json()
+                    return {
+                        "worker_id": target_url,
+                        "answer": response_payload.get("response", "").strip(),
+                        "latency": time.time() - request_started_at,
+                    }
+
                 response = await client.post(f"{target_url}/process", json=payload)
+                response.raise_for_status()
                 return response.json()
                 
         except (httpx.ConnectError, httpx.ReadTimeout) as e:

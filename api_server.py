@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+import os
 import uvicorn
 from load_balancer.lb import LoadBalancer
 from master.scheduler import Scheduler
@@ -13,12 +14,12 @@ async def startup_event():
 
 # N-setup el Load Balancer w el Scheduler m3 el 4 workers
 worker_urls = [
-    "http://127.0.0.1:8001", 
-    "http://127.0.0.1:8002", 
-    "http://127.0.0.1:8003", 
-    "http://127.0.0.1:8004"
+    url.strip()
+    for url in os.getenv("OLLAMA_WORKERS", "http://216.81.200.238:11434").split(",")
+    if url.strip()
 ]
-lb = LoadBalancer(worker_urls)
+ollama_model = os.getenv("OLLAMA_MODEL", "tinyllama")
+lb = LoadBalancer(worker_urls, backend="ollama", model_name=ollama_model)
 scheduler = Scheduler(lb)
 
 # Format el Data elly gaya mn Locust
