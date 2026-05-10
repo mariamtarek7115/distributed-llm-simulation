@@ -1,45 +1,60 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os
+import asyncio
 import uvicorn
+
 from load_balancer.lb import LoadBalancer
 from master.scheduler import Scheduler
-import asyncio
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(lb.heartbeat_loop())
-
-# N-setup el Load Balancer w el Scheduler m3 el 4 workers
+# -----------------------
+# WORKERS (IMPORTANT FIX)
+# -----------------------
 worker_urls = [
-    url.strip()
-    for url in os.getenv("OLLAMA_WORKERS", "http://216.81.200.238:11434").split(",")
-    if url.strip()
+    "https://j87rla8a-11434.thundercompute.net",
+    "https://8bby694v-11434.thundercompute.net",
+    "https://rrs3mb7w-11434.thundercompute.net",
+    "https://ln3xcktv-11434.thundercompute.net"
 ]
-ollama_model = os.getenv("OLLAMA_MODEL", "tinyllama")
-lb = LoadBalancer(worker_urls, backend="ollama", model_name=ollama_model)
+
+model = "tinyllama"
+
+lb = LoadBalancer(worker_urls, backend="ollama", model_name=model)
 scheduler = Scheduler(lb)
 
-# Format el Data elly gaya mn Locust
+# -----------------------
+# STARTUP (heartbeat)
+# -----------------------
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(lb.heartbeat_loop())
+
+# -----------------------
+# REQUEST FORMAT
+# -----------------------
 class ChatRequest(BaseModel):
     user_id: int
     prompt: str
-    use_rag: bool = True
+    use_rag: bool = False
 
-# El Endpoint elly Locust hay-Drob 3aleh
+# -----------------------
+# MAIN ENDPOINT
+# -----------------------
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
+async def chat(req: ChatRequest):
     payload = {
-        "user_id": req.user_id, 
-        "prompt": req.prompt, 
+        "user_id": req.user_id,
+        "prompt": req.prompt,
         "use_rag": req.use_rag
     }
-    # N-b3at el request lel Scheduler (elly hyzbt el RAG w y-forward lel LB)
-    response = await scheduler.handle_request(payload)
-    return response
 
+    return await scheduler.handle_request(payload)
+
+# -----------------------
+# RUN SERVER
+# -----------------------
 if __name__ == "__main__":
-    print("🚀 API Gateway / Load Balancer started on Port 8000...")
+    print("API Gateway running on http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
