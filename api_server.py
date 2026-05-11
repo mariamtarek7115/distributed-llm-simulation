@@ -1,34 +1,38 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import os
 import asyncio
 import uvicorn
 
+from common.config import load_config
 from load_balancer.lb import LoadBalancer
 from master.scheduler import Scheduler
 
 app = FastAPI()
+config = load_config()
 
-# -----------------------
-# WORKERS (IMPORTANT FIX)
-# -----------------------
-worker_urls = [
-    "https://j87rla8a-11434.thundercompute.net",
-    "https://8bby694v-11434.thundercompute.net",
-    "https://rrs3mb7w-11434.thundercompute.net",
-    "https://ln3xcktv-11434.thundercompute.net"
-]
-
-model = "tinyllama"
-
-lb = LoadBalancer(worker_urls, backend="ollama", model_name=model)
-scheduler = Scheduler(lb)
+lb = LoadBalancer(
+    config.worker_urls,
+    backend="ollama",
+    model_name=config.model_name,
+    worker_health_urls=config.worker_health_urls,
+    worker_metrics_urls=config.worker_metrics_urls,
+    strategy=config.load_balancer_strategy,
+)
+scheduler = Scheduler(
+    lb,
+    max_workers=config.max_workers,
+    queue_size=config.queue_size,
+    retry_workers=config.retry_workers,
+    max_retries=config.max_retries,
+    request_timeout=config.request_timeout,
+)
 
 # -----------------------
 # STARTUP (heartbeat)
 # -----------------------
 @app.on_event("startup")
 async def startup():
+    await lb.start_background_tasks()
     asyncio.create_task(lb.heartbeat_loop())
 
 # -----------------------
@@ -57,4 +61,7 @@ async def chat(req: ChatRequest):
 # -----------------------
 if __name__ == "__main__":
     print("API Gateway running on http://localhost:8000")
+    print("Workers:", config.worker_urls)
+    print("Strategy:", config.load_balancer_strategy)
+    print("Model:", config.model_name)
     uvicorn.run(app, host="0.0.0.0", port=8000)
