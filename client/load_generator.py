@@ -13,7 +13,12 @@ QUESTIONS = [
 ]
 
 def _format_response_line(result):
-    status = "SUCCESS" if result.get("success", False) else "FAIL"
+    if result.get("fallback", False):
+        status = "OVERLOADED"
+    elif result.get("success", False):
+        status = "SUCCESS"
+    else:
+        status = "FAIL"
     answer = str(result.get("answer", "")).replace("\n", " ").strip()
     return (
         f"request_id={result.get('request_id', 'unknown')} | "
@@ -74,13 +79,21 @@ async def simulate_user(user_id, scheduler, sem):
         start = time.time()
         
         response = await scheduler.handle_request(payload)
-        
-        latency = time.time() - start
-        
+
+        is_fallback = response.get("fallback", False)
+        # For overloaded/fallback responses, use the scheduler-measured latency
+        # (time from scheduler entry to response return). Otherwise use the
+        # client-side end-to-end latency.
+        if is_fallback:
+            latency = response.get("latency", time.time() - start)
+        else:
+            latency = time.time() - start
+
         result = {
             "request_id": response.get("request_id"),
             "worker_id": response.get("worker_id"),
             "success": response.get("success", True),
+            "fallback": is_fallback,
             "latency": latency,
             "answer": response.get("answer", ""),
         }
@@ -133,4 +146,7 @@ async def run_load_test(scheduler, load_balancer, num_users=1000, max_concurrent
         summary = _print_metrics_summary(results, total_time, worker_metrics, interrupted=interrupted)
 
     summary["total_time"] = total_time
+    summary["completed_count"] = len(results)
+    summary["failure_count"] = sum(1 for result in results if not result.get("success", False))
+    summary["fallback_count"] = sum(1 for result in results if result.get("fallback", False))
     return summary

@@ -44,6 +44,7 @@ class Scheduler:
     # PUBLIC ENTRY POINT
     # =========================================================
     async def handle_request(self, payload):
+        start = time.time()
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
@@ -51,7 +52,22 @@ class Scheduler:
         payload["retry_count"] = 0
 
         # enqueue request
-        await self.queue.put((payload, future))
+        try:
+            self.queue.put_nowait((payload, future))
+        except asyncio.QueueFull:
+            overload_response = {
+                "request_id": payload.get("request_id"),
+                "worker_id": "SYSTEM_OVERLOAD",
+                "latency": time.time() - start,
+                "success": True,
+                "fallback": True,
+                "answer": "System is overloaded. Try again later.",
+            }
+            print(
+                f"[SCHEDULER] OVERLOADED | request_id={overload_response['request_id']} | "
+                f"latency={overload_response['latency']:.4f}s | response={overload_response['answer']}"
+            )
+            return overload_response
 
         # start workers once
         if not self.workers_started:
@@ -151,6 +167,7 @@ class Scheduler:
             "worker_id": result["worker_id"],
             "latency": total_latency,
             "success": result.get("success", True),
+            "fallback": result.get("fallback", False),
             "answer": result["answer"][:120]
         }
 
@@ -176,9 +193,11 @@ class Scheduler:
         else:
 
             future.set_result({
+                "request_id": payload.get("request_id"),
                 "worker_id": "TIMEOUT",
                 "latency": 0,
                 "success": False,
+                "fallback": False,
                 "answer": (
                     f"Request failed after "
                     f"{self.max_retries} retries."

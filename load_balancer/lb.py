@@ -201,7 +201,8 @@ class LoadBalancer:
                     "worker_id": self.worker_labels[target_url],
                     "answer": data.get("response", ""),
                     "latency": latency,
-                    "success": True
+                    "success": True,
+                    "fallback": False
                 }
 
         except Exception as e:
