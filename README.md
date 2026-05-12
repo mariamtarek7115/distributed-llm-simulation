@@ -1,256 +1,362 @@
 # Distributed LLM Simulation
 
-This project simulates a distributed LLM inference system with:
+A distributed system that handles 1000+ concurrent LLM inference requests across multiple GPU worker nodes, with RAG enrichment, load balancing, fault tolerance, and graceful overload handling.
 
-- multiple worker endpoints
-- a scheduler and retry queue
-- load balancing strategies
-- scenario-based testing for failures, rerouting, recovery, and total outage
+Implements the CSE354 Distributed Computing course project: **"Efficient Load Balancing and GPU Cluster Task Distribution for Handling 1000+ Concurrent LLM Requests"**.
 
-The main test entrypoint is `main.py`. It reads settings from `.env`, builds the load balancer and scheduler, then runs the selected scenario.
+---
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Project Layout](#project-layout)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration (`.env`)](#configuration-env)
+- [How To Run](#how-to-run)
+- [Load Balancing Strategies](#load-balancing-strategies)
+- [Test Scenarios](#test-scenarios)
+- [Terminal Log Legend](#terminal-log-legend)
+- [Metrics Block](#metrics-block)
+- [Load-Test Sweep](#load-test-sweep)
+- [API Gateway Mode](#api-gateway-mode)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Architecture
+
+```
++-----------------+
+|  Client Layer   |   simulates N concurrent users
++--------+--------+
+         |
+         v
++-----------------+
+|    Scheduler    |   main queue (capacity QUEUE_SIZE)
+|     (Master)    |   retry queue (exponential backoff)
++--------+--------+
+         |
+         v
++-----------------+         +-----------------+
+| Load Balancer   |-------->|   RAG Module    |
+| round_robin /   |         | (FAISS + ST)    |
+| least_conn /    |         +-----------------+
+| load_aware      |
++--------+--------+
+         |
+         v
++--------+--------+--------+--------+
+| GPU-0 | GPU-1 | GPU-2 | GPU-3 |    Worker nodes (Ollama on Thunder Compute)
++-------+-------+-------+-------+
+```
+
+**Layers:**
+- **Client** — `client/load_generator.py` simulates users with staggered arrivals.
+- **Scheduler / Master** — `master/scheduler.py` owns the request queue, retry queue, dispatcher pool, and overload handling.
+- **Load Balancer** — `load_balancer/lb.py` selects a worker via round_robin / least_connections / load_aware; tracks dead nodes; runs heartbeat and metrics-polling background loops.
+- **RAG Module** — `rag/retriever.py` uses `sentence-transformers` + FAISS for context retrieval.
+- **Workers** — Ollama instances exposing `/api/generate` (4 Thunder Compute endpoints by default).
+
+---
+
+## Project Layout
+
+```
+api_server.py             FastAPI gateway (alternative entrypoint)
+main.py                   Scenario test entrypoint
+sweep_load_test.py        Automated user-count sweep (writes CSV)
+.env                      All runtime configuration
+client/
+  load_generator.py       Simulated users + metrics block
+  scenario_runner.py      Scenario orchestration loops
+common/
+  config.py               .env parser
+load_balancer/
+  lb.py                   Worker selection, heartbeat, metrics polling
+master/
+  scheduler.py            Queue, dispatcher, retry, overload fallback
+rag/
+  retriever.py            FAISS-backed context retrieval
+workers/
+  gpu_worker.py           Reference worker (FastAPI; Ollama is used in practice)
+llm/
+  inference.py            LLM wrapper
+```
+
+---
 
 ## Prerequisites
 
-- Python virtual environment created at `.venv`
-- dependencies installed from `requirements.txt`
-- valid worker generation endpoints in `.env`
-- valid health endpoints in `.env`
-- valid metrics endpoints in `.env` if `LOAD_BALANCER_STRATEGY=load_aware`
+- Python 3.11+
+- Virtual environment at `.venv`
+- Worker generation endpoints reachable
+- Health endpoints reachable
+- Metrics endpoints reachable if you use `load_aware`
+
+---
 
 ## Installation
-
-From the project root:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## Main Files
+---
 
-- `main.py`: runs scenario-based testing directly from `.env`
-- `api_server.py`: runs the FastAPI gateway with `/chat`
-- `.env`: stores worker endpoints, strategy, scenario, and test settings
-- `client/scenario_runner.py`: selects and applies the configured scenario
-- `client/load_generator.py`: runs the simulated users and prints metrics
+## Configuration (`.env`)
 
-## How To Run A Test
+### Worker endpoints (one block per worker)
 
-For scenario testing, run:
+```dotenv
+OLLAMA_WORKER_URL_0=https://<id>-11434.thundercompute.net/api/generate
+OLLAMA_WORKER_HEALTH_URL_0=https://<id>-8080.thundercompute.net/health
+WORKER_METRICS_URL_0=http://127.0.0.1:9090/metrics
+```
+
+### Model and load balancing
+
+| Variable | Values | Purpose |
+|---|---|---|
+| `OLLAMA_MODEL` | e.g. `tinyllama` | Model name sent to `/api/generate` |
+| `LOAD_BALANCER_STRATEGY` | `round_robin` / `least_connections` / `load_aware` | Worker selection strategy |
+
+### Scenario
+
+| Variable | Values | Purpose |
+|---|---|---|
+| `SCENARIO` | `normal` / `random_failures` / `node_down_recovery` / `all_nodes_down` | Which test scenario to run |
+
+### Load generation
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NUM_USERS` | 100 | Total simulated requests |
+| `CONCURRENCY` | 10 | Maximum concurrent in-flight users (client-side throttle) |
+
+### Failure / recovery
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FAILURE_RATE` | 0.2 | Probability of killing a worker every 2s in `random_failures` |
+| `RECOVERY_TIME` | 10 | Seconds before a randomly killed worker is restored |
+| `NODE_DOWN_WORKER_INDEX` | 0 | Which worker to kill in `node_down_recovery` |
+| `NODE_DOWN_AFTER_SECONDS` | 2 | When to kill it |
+| `NODE_RECOVERY_AFTER_SECONDS` | 10 | When to recover it (use 0 to keep down) |
+| `ALL_NODES_DOWN_AFTER_SECONDS` | 2 | When to trigger total outage |
+| `ALL_NODES_RECOVERY_AFTER_SECONDS` | 0 | When to recover (0 = stay down) |
+
+### Scheduler / retry
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_WORKERS` | 4 | Main dispatcher tasks |
+| `QUEUE_SIZE` | 200 | Main queue capacity (overflow → instant overload fallback) |
+| `RETRY_WORKERS` | 2 | Retry-dispatcher tasks |
+| `MAX_RETRIES` | 3 | Retry attempts per failed request |
+| `REQUEST_TIMEOUT` | 120 | Per-call timeout (seconds) |
+
+---
+
+## How To Run
+
+### Single scenario (uses `.env`)
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python main.py
 ```
 
-The program will read `.env` and print:
+### Sweep (multiple user counts in one go)
 
-- average latency
-- p95 latency
-- throughput
-- average CPU usage
-- average GPU utilization
-- worker distribution
-- per-worker resource snapshot
-
-## .env Settings Used During Tests
-
-### Worker Endpoints
-
-Each worker has three settings:
-
-- `OLLAMA_WORKER_URL_n`: generation endpoint
-- `OLLAMA_WORKER_HEALTH_URL_n`: health check endpoint
-- `WORKER_METRICS_URL_n`: metrics endpoint used by `load_aware`
-
-Example:
-
-```dotenv
-OLLAMA_WORKER_URL_0=https://worker-id-11434.thundercompute.net/api/generate
-OLLAMA_WORKER_HEALTH_URL_0=https://worker-id-8080.thundercompute.net/health
-WORKER_METRICS_URL_0=http://127.0.0.1:9090/metrics
+```powershell
+python sweep_load_test.py
+python sweep_load_test.py --users 100,250,500,1000 --out sweep.csv
 ```
 
-### Load Balancer Strategy
+See [Load-Test Sweep](#load-test-sweep) below.
 
-Available values:
+---
 
-- `LOAD_BALANCER_STRATEGY=least_connections`
-- `LOAD_BALANCER_STRATEGY=load_aware`
+## Load Balancing Strategies
 
-Behavior:
+Set `LOAD_BALANCER_STRATEGY` in `.env`:
 
-- `least_connections`: routes to the worker with the fewest assigned active requests
-- `load_aware`: routes using cached metrics, preferring lower GPU usage, then lower CPU usage, then lower active connections
+| Strategy | Behavior | When to use |
+|---|---|---|
+| `round_robin` | Rotates through alive workers in order. Skips dead nodes. | Even distribution baseline. Good when workers are homogeneous. |
+| `least_connections` | Picks the alive worker with the fewest active in-flight requests. Ties broken by round-robin. | Workers vary in speed; smooths uneven request durations. |
+| `load_aware` | Uses cached metrics: lowest GPU% → lowest CPU% → fewest active connections. | Most realistic; reflects actual GPU pressure. Requires reachable metrics endpoints. |
 
-### Scenario Selection
+If `load_aware` cannot fetch metrics, it falls back to `least_connections` automatically.
 
-Available values for `SCENARIO`:
+---
 
-- `normal`
-- `random_failures`
-- `node_down_recovery`
-- `all_nodes_down`
+## Test Scenarios
 
-## Running Each Scenario
+### 1. `normal` — baseline
 
-### 1. Normal
-
-Purpose: baseline run without artificial delay or failures.
-
-Recommended `.env` values:
-
+Recommended:
 ```dotenv
 SCENARIO=normal
 NUM_USERS=100
-CONCURRENCY=10
+CONCURRENCY=20
 ```
+Demonstrates: end-to-end throughput, per-worker distribution, RAG enrichment.
 
-Run:
+### 2. `random_failures` — chaos engineering
 
-```powershell
-python main.py
-```
-
-### 2. Random Failures
-
-Purpose: simulate worker failures while keeping at least one worker alive so failed tasks are redirected to other healthy workers.
-
-Recommended `.env` values:
-
+Recommended:
 ```dotenv
 SCENARIO=random_failures
-FAILURE_RATE=0.2
+FAILURE_RATE=0.3
 RECOVERY_TIME=10
-NUM_USERS=100
-CONCURRENCY=10
+NUM_USERS=200
+CONCURRENCY=30
 ```
+Demonstrates: random worker kills + auto-recovery + retry-queue requeue + load balancer continuing to operate.
 
-Run:
+### 3. `node_down_recovery` — controlled fault injection
 
-```powershell
-python main.py
-```
-
-Note: this scenario is designed to test failover. It is most useful when multiple workers are configured.
-
-### 3. One Node Down, Then Recovery
-
-Purpose: take one chosen worker down, stop assigning new tasks to it, then allow it to receive tasks again after the configured recovery delay.
-
-Recommended `.env` values:
-
+Recommended:
 ```dotenv
 SCENARIO=node_down_recovery
 NODE_DOWN_WORKER_INDEX=0
-NODE_DOWN_AFTER_SECONDS=2
-NODE_RECOVERY_AFTER_SECONDS=10
-NUM_USERS=100
-CONCURRENCY=10
+NODE_DOWN_AFTER_SECONDS=10
+NODE_RECOVERY_AFTER_SECONDS=20
+NUM_USERS=200
+CONCURRENCY=30
 ```
+Demonstrates: deterministic single-node outage, traffic re-routing, recovery.
 
-Run:
+> Note: in-flight requests already at the killed worker may still complete (network can't be recalled); subsequent requests are routed elsewhere. This is correct fault-tolerance behavior.
 
-```powershell
-python main.py
-```
+### 4. `all_nodes_down` — total outage
 
-### 4. All Nodes Down
-
-Purpose: simulate a total outage. Once all workers are marked unhealthy, the system returns a safe fallback response telling the caller to try again later.
-
-Recommended `.env` values:
-
+Recommended:
 ```dotenv
 SCENARIO=all_nodes_down
-ALL_NODES_DOWN_AFTER_SECONDS=2
-ALL_NODES_RECOVERY_AFTER_SECONDS=0
+ALL_NODES_DOWN_AFTER_SECONDS=10
+ALL_NODES_RECOVERY_AFTER_SECONDS=20
 NUM_USERS=100
-CONCURRENCY=10
+CONCURRENCY=20
+```
+Demonstrates: graceful degradation — every request during outage gets `worker_id=SYSTEM_SHUTDOWN` and the system recovers when workers are back.
+
+---
+
+## Terminal Log Legend
+
+| Tag | Meaning |
+|---|---|
+| `[QUEUE] user=X` / `[QUEUE] users=A-B (N admitted)` | Request(s) accepted into the main queue. Batched to reduce log flooding. |
+| `[OVERLOADED] user=X rejected` | Main queue is full. Request returned an instant safe-fallback response. Counted as `overloaded`. |
+| `[RESPONSE] user=X \| status=SUCCESS \| worker_id=GPU-N \| latency=...` | LLM responded successfully. |
+| `[RESPONSE] user=X \| status=FAIL \| worker_id=TIMEOUT` | All retries exhausted or system-shutdown response. Counted as `failed`. |
+| `[RETRY] user=X \| attempt=k/MAX \| reason=... \| backoff=Ns` | Request hit an error and was pushed to the retry queue. Backoff is `2 * attempt` seconds. |
+| `[FAILED] user=X \| retries_exhausted (MAX)` | Final failure after exhausting retries. |
+| `!!! WORKER DOWN ... GPU-N IS DEAD !!!` (banner) | A worker was marked unhealthy. New requests will not be routed to it. |
+| `+++ WORKER RECOVERED ... GPU-N IS ALIVE AGAIN +++` (banner) | A worker was restored and is selectable again. |
+
+Logs are interleaved in real-time — `[QUEUE]` admissions are batched (10 at a time or every 0.5s) so the terminal isn't flooded at startup.
+
+---
+
+## Metrics Block
+
+Printed at end of run (or on Ctrl+C, labelled `TERMINATED RUN METRICS`):
+
+```
+============================================================
+  RUN METRICS
+============================================================
+  total_requests       : 1000
+  success              : 712
+  overloaded (fallback): 261
+  failed               : 27
+  total_time           : 84.10s
+  throughput           : 11.89 req/s
+  average_latency      : 6.41s
+  p95_latency          : 18.22s
+  average_cpu_usage    : 24.50%
+  average_gpu_usage    : 71.32%
+  --------------------------------------------------------
+  per-worker metrics:
+    GPU-0    | cpu= 22.10% | gpu= 68.40% | active_conn=0   | timestamp=...
+    ...
+============================================================
 ```
 
-Run:
+| Metric | Meaning |
+|---|---|
+| `success` | Successful LLM responses (incl. retries that eventually succeeded). |
+| `overloaded (fallback)` | Requests rejected because the main queue was full. |
+| `failed` | Requests that exhausted all retries or hit a SYSTEM_SHUTDOWN response. |
+| `throughput` | Completed requests per second. |
+| `average_latency` / `p95_latency` | Client-measured (queue wait + processing). For overloaded requests, latency is measured from scheduler entry to fallback return. |
+| `average_cpu_usage` / `average_gpu_usage` | Mean across alive workers, from cached metrics snapshots. |
+
+---
+
+## Load-Test Sweep
+
+`sweep_load_test.py` runs the system at several user counts back-to-back and writes a CSV summary you can paste into a spreadsheet for the report.
 
 ```powershell
-python main.py
+# defaults: 100, 250, 500, 1000 users, concurrency = users
+python sweep_load_test.py
+
+# custom user steps
+python sweep_load_test.py --users 50,100,500,1000 --out my_sweep.csv
+
+# fix concurrency across all steps
+python sweep_load_test.py --users 100,500,1000 --concurrency 100
 ```
 
-If `ALL_NODES_RECOVERY_AFTER_SECONDS=0`, the workers stay down for the rest of the run.
+Output CSV columns:
+`users, concurrency, completed, success, overloaded, failed, total_time_s, throughput_req_s, avg_latency_s, p95_latency_s, avg_cpu_pct, avg_gpu_pct, strategy, scenario`
 
-## Testing High Load
+The script reuses `.env` for everything except `NUM_USERS` and `CONCURRENCY`, so set `SCENARIO`, `LOAD_BALANCER_STRATEGY`, etc. in `.env` first.
 
-To simulate heavier load, keep the scenario you want and increase:
+---
 
-```dotenv
-NUM_USERS=1000
-CONCURRENCY=100
-```
+## API Gateway Mode
 
-Then run:
-
-```powershell
-python main.py
-```
-
-Start with smaller values first to verify the endpoints are reachable before running large tests.
-
-## Running The API Gateway Instead
-
-If you want to test through the FastAPI gateway rather than directly through `main.py`, run:
+Instead of the scenario runner, you can expose a FastAPI endpoint:
 
 ```powershell
 python api_server.py
 ```
 
-Then send requests to:
+POST a single request:
 
-```text
+```http
 POST http://localhost:8000/chat
-```
-
-Example request body:
-
-```json
 {
-	"user_id": 1,
-	"prompt": "Explain what a REST API is in two sentences.",
-	"use_rag": true
+  "user_id": 1,
+  "prompt": "Explain what a REST API is.",
+  "use_rag": true
 }
 ```
 
+---
+
 ## Troubleshooting
 
-- If `python main.py` exits immediately, verify the worker URLs in `.env` are reachable.
-- If `load_aware` does not seem to use metrics, verify each `WORKER_METRICS_URL_n` is reachable from the machine running this code.
-- If health checks fail, verify each `OLLAMA_WORKER_HEALTH_URL_n` returns `200 OK`.
-- If generation fails, verify each `OLLAMA_WORKER_URL_n` accepts `POST` requests with model, prompt, and stream fields.
-- Simulated scenario failures are intentionally independent from heartbeat success so reliability behavior can be tested even when health endpoints still return `200 OK`.
+- **Run exits immediately** — verify worker URLs in `.env` are reachable.
+- **`load_aware` not using metrics** — verify each `WORKER_METRICS_URL_n` returns the expected JSON.
+- **All requests hit `[OVERLOADED]`** — `CONCURRENCY > MAX_WORKERS + QUEUE_SIZE`. Either increase `QUEUE_SIZE` or accept the overload as the intended demonstration.
+- **No `[RETRY]` lines visible** — set `REQUEST_TIMEOUT=2` and run `random_failures` to force visible retries.
+- **`status=FAIL` during `all_nodes_down`** — expected; the system returns a `SYSTEM_SHUTDOWN` response while no workers are alive.
+- **Simulated worker outages don't auto-revive on heartbeat** — by design. `simulated=True` outages stay down until the scenario explicitly recovers them, even if the underlying health endpoint says `200 OK`.
 
-## Quick Example Configs
+---
 
-### Small Sanity Test
+## Capacity formula
 
-```dotenv
-SCENARIO=normal
-NUM_USERS=5
-CONCURRENCY=2
-LOAD_BALANCER_STRATEGY=least_connections
+```
+acceptance_window = MAX_WORKERS + QUEUE_SIZE
 ```
 
-### Load-Aware Test
-
-```dotenv
-SCENARIO=normal
-NUM_USERS=100
-CONCURRENCY=20
-LOAD_BALANCER_STRATEGY=load_aware
-```
-
-### Stress Test
-
-```dotenv
-SCENARIO=normal
-NUM_USERS=1000
-CONCURRENCY=100
-LOAD_BALANCER_STRATEGY=load_aware
-```
+A simultaneous burst larger than this produces `[OVERLOADED]` rejections. Smaller bursts are absorbed by the queue and dispatched as workers free up.

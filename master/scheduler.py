@@ -40,6 +40,39 @@ class Scheduler:
 
         self.workers_started = False
 
+        # ----------------------------
+        # QUEUE-LOG BATCHING
+        # ----------------------------
+        # Avoid flooding the terminal with one [QUEUE] line per admission.
+        # Buffer admitted user_ids and flush them as a single summary line
+        # either when the batch fills up or when enough time passes.
+        self._queue_log_batch = []
+        self._queue_log_batch_size = 10
+        self._queue_log_flush_interval = 0.5  # seconds
+        self._queue_log_last_flush = time.monotonic()
+
+    def _flush_queue_log(self, force=False):
+        if not self._queue_log_batch:
+            self._queue_log_last_flush = time.monotonic()
+            return
+        now = time.monotonic()
+        if (
+            force
+            or len(self._queue_log_batch) >= self._queue_log_batch_size
+            or (now - self._queue_log_last_flush) >= self._queue_log_flush_interval
+        ):
+            ids = self._queue_log_batch
+            if len(ids) == 1:
+                label = f"user={ids[0]}"
+            else:
+                label = f"users={ids[0]}-{ids[-1]} ({len(ids)} admitted)"
+            print(
+                f"[QUEUE] {label} | "
+                f"queue_size={self.queue.qsize()}/{self.queue.maxsize}"
+            )
+            self._queue_log_batch = []
+            self._queue_log_last_flush = now
+
     # =========================================================
     # PUBLIC ENTRY POINT
     # =========================================================
@@ -51,10 +84,17 @@ class Scheduler:
         # retry count starts at 0
         payload["retry_count"] = 0
 
+        user_id = payload.get("user_id", "unknown")
+
         # enqueue request
         try:
             self.queue.put_nowait((payload, future))
+            self._queue_log_batch.append(user_id)
+            self._flush_queue_log()
         except asyncio.QueueFull:
+            # Flush any pending queue admissions so the OVERLOADED line
+            # appears in the correct chronological position.
+            self._flush_queue_log(force=True)
             overload_response = {
                 "request_id": payload.get("request_id"),
                 "worker_id": "SYSTEM_OVERLOAD",
@@ -64,8 +104,10 @@ class Scheduler:
                 "answer": "System is overloaded. Try again later.",
             }
             print(
-                f"[SCHEDULER] OVERLOADED | request_id={overload_response['request_id']} | "
-                f"latency={overload_response['latency']:.4f}s | response={overload_response['answer']}"
+                f"[OVERLOADED] user={user_id} rejected | "
+                f"queue_size={self.queue.qsize()}/{self.queue.maxsize} | "
+                f"latency={overload_response['latency']:.4f}s | "
+                f"response={overload_response['answer']}"
             )
             return overload_response
 
@@ -179,12 +221,19 @@ class Scheduler:
         payload["retry_count"] += 1
 
         retry_count = payload["retry_count"]
+        user_id = payload.get("user_id", "unknown")
 
         # -------------------------------------------------
         # SEND TO RETRY QUEUE
         # -------------------------------------------------
         if retry_count <= self.max_retries:
 
+            backoff = 2 * retry_count
+            print(
+                f"[RETRY] user={user_id} | attempt={retry_count}/{self.max_retries} | "
+                f"reason={error_message} | backoff={backoff}s | "
+                f"retry_queue_size={self.retry_queue.qsize()}/{self.retry_queue.maxsize}"
+            )
             await self.retry_queue.put((payload, future))
 
         # -------------------------------------------------
@@ -192,6 +241,10 @@ class Scheduler:
         # -------------------------------------------------
         else:
 
+            print(
+                f"[FAILED] user={user_id} | retries_exhausted ({self.max_retries}) | "
+                f"last_reason={error_message}"
+            )
             future.set_result({
                 "request_id": payload.get("request_id"),
                 "worker_id": "TIMEOUT",

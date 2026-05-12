@@ -75,6 +75,14 @@ class LoadBalancer:
                                 )
                                 self.dead_nodes.remove(node)
                                 self.active_connections[node] = 0
+                                label = self.worker_labels[node]
+                                banner = "+" * 60
+                                print(
+                                    f"\n{banner}\n"
+                                    f"+++  *** WORKER RECOVERED ***  {label} IS ALIVE AGAIN  +++\n"
+                                    f"+++  {label} IS NOW ACCEPTING REQUESTS\n"
+                                    f"{banner}\n"
+                                )
 
                         except Exception:
                             pass
@@ -89,13 +97,31 @@ class LoadBalancer:
             asyncio.create_task(self._metrics_refresh_loop())
 
     # ----------------------------
-    # MAIN ROUTING LOGIC (LEAST CONNECTIONS + ROUND-ROBIN TIE BREAK)
+    # MAIN ROUTING LOGIC (ROUND ROBIN / LEAST CONNECTIONS / LOAD AWARE)
     # ----------------------------
     async def _select_target(self):
         if self.strategy == "load_aware":
             return self._select_target_by_load()
 
+        if self.strategy == "round_robin":
+            return self._select_target_by_round_robin()
+
         return self._select_target_by_least_connections()
+
+    def _select_target_by_round_robin(self):
+        alive_workers = [url for url in self.worker_urls if url not in self.dead_nodes]
+        if not alive_workers:
+            return None
+
+        # Walk the worker list starting at next_index until we find an alive one.
+        for offset in range(len(self.worker_urls)):
+            index = (self.next_index + offset) % len(self.worker_urls)
+            candidate = self.worker_urls[index]
+            if candidate in alive_workers:
+                self.next_index = (index + 1) % len(self.worker_urls)
+                return candidate
+
+        return alive_workers[0]
 
     def _select_target_by_least_connections(self):
         available_nodes = {
@@ -365,6 +391,7 @@ class LoadBalancer:
         if worker_url not in self.worker_urls:
             raise ValueError(f"Unknown worker URL: {worker_url}")
 
+        already_down = worker_url in self.dead_nodes
         self.dead_nodes.add(worker_url)
         if simulated:
             self.simulated_dead_nodes.add(worker_url)
@@ -375,6 +402,16 @@ class LoadBalancer:
             reason,
             self._dead_node_labels(),
         )
+        if not already_down:
+            label = self.worker_labels[worker_url]
+            banner = "!" * 60
+            print(
+                f"\n{banner}\n"
+                f"!!!  *** WORKER DOWN ***  {label} IS DEAD  !!!\n"
+                f"!!!  reason={reason}\n"
+                f"!!!  {label} WILL NO LONGER ACCEPT REQUESTS\n"
+                f"{banner}\n"
+            )
 
     def recover_worker(self, worker_url):
         if worker_url in self.dead_nodes:
@@ -385,6 +422,14 @@ class LoadBalancer:
                 "event=worker_recovered worker_id=%s active_connections=%s",
                 self.worker_labels[worker_url],
                 self._active_connections_snapshot(),
+            )
+            label = self.worker_labels[worker_url]
+            banner = "+" * 60
+            print(
+                f"\n{banner}\n"
+                f"+++  *** WORKER RECOVERED ***  {label} IS ALIVE AGAIN  +++\n"
+                f"+++  {label} IS NOW ACCEPTING REQUESTS\n"
+                f"{banner}\n"
             )
 
     def recover_all_workers(self):

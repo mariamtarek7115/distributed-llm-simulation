@@ -12,7 +12,7 @@ QUESTIONS = [
     "Where is Ain Shams University located, and what do we learn in CSE354?" 
 ]
 
-def _format_response_line(result):
+def _format_response_line(result, user_id):
     if result.get("fallback", False):
         status = "OVERLOADED"
     elif result.get("success", False):
@@ -21,6 +21,7 @@ def _format_response_line(result):
         status = "FAIL"
     answer = str(result.get("answer", "")).replace("\n", " ").strip()
     return (
+        f"[RESPONSE] user={user_id} | "
         f"request_id={result.get('request_id', 'unknown')} | "
         f"status={status} | "
         f"worker_id={result.get('worker_id', 'unknown')} | "
@@ -30,37 +31,49 @@ def _format_response_line(result):
 
 
 def _print_metrics_summary(results, total_time, worker_metrics, interrupted=False):
-    latencies = []
+    latencies = [r.get("latency", 0.0) for r in results]
 
-    for result in results:
-        latencies.append(result.get("latency", 0.0))
+    completed = len(results)
+    success_count = sum(1 for r in results if r.get("success", False) and not r.get("fallback", False))
+    overloaded_count = sum(1 for r in results if r.get("fallback", False))
+    failure_count = sum(1 for r in results if not r.get("success", False))
 
     avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
     p95_latency = _percentile(latencies, 95)
-    throughput = len(results) / total_time if total_time > 0 else 0.0
+    throughput = completed / total_time if total_time > 0 else 0.0
     metrics_summary = _build_metrics_summary(worker_metrics)
 
     title = "RUN METRICS" if not interrupted else "TERMINATED RUN METRICS"
-    print(f"\n=== {title} ===")
-    print(f"average_latency={avg_latency:.2f}s")
-    print(f"p95_latency={p95_latency:.2f}s")
-    print(f"throughput={throughput:.2f} req/s")
+    bar = "=" * 60
+    print(f"\n{bar}")
+    print(f"  {title}")
+    print(bar)
+    print(f"  total_requests       : {completed}")
+    print(f"  success              : {success_count}")
+    print(f"  overloaded (fallback): {overloaded_count}")
+    print(f"  failed               : {failure_count}")
+    print(f"  total_time           : {total_time:.2f}s")
+    print(f"  throughput           : {throughput:.2f} req/s")
+    print(f"  average_latency      : {avg_latency:.2f}s")
+    print(f"  p95_latency          : {p95_latency:.2f}s")
 
     if metrics_summary:
-        print(f"average_cpu_usage={metrics_summary['avg_cpu']:.2f}%")
-        print(f"average_gpu_utilization={metrics_summary['avg_gpu']:.2f}%")
-        print("worker_metrics:")
+        print(f"  average_cpu_usage    : {metrics_summary['avg_cpu']:.2f}%")
+        print(f"  average_gpu_usage    : {metrics_summary['avg_gpu']:.2f}%")
+        print(f"  {'-' * 56}")
+        print(f"  per-worker metrics:")
         for worker in metrics_summary["workers"]:
             print(
-                f"  {worker['worker_id']} | "
-                f"cpu={worker['cpu_usage']:.2f}% | "
-                f"gpu={worker['gpu_usage']:.2f}% | "
-                f"active_connections={worker['active_connections']} | "
+                f"    {worker['worker_id']:<8} | "
+                f"cpu={worker['cpu_usage']:6.2f}% | "
+                f"gpu={worker['gpu_usage']:6.2f}% | "
+                f"active_conn={worker['active_connections']:<3} | "
                 f"timestamp={worker['timestamp']}"
             )
     else:
-        print("average_cpu_usage=unavailable")
-        print("average_gpu_utilization=unavailable")
+        print(f"  average_cpu_usage    : unavailable")
+        print(f"  average_gpu_usage    : unavailable")
+    print(f"{bar}\n")
 
     return {
         "avg_latency": avg_latency,
@@ -98,7 +111,10 @@ async def simulate_user(user_id, scheduler, sem):
             "answer": response.get("answer", ""),
         }
 
-        print(_format_response_line(result))
+        # Only print full response details for processed requests.
+        # Overloaded/rejected requests already printed [OVERLOADED] in the scheduler.
+        if not is_fallback:
+            print(_format_response_line(result, user_id))
         return result
 
 def _percentile(values, percentile):
@@ -124,24 +140,41 @@ def _build_metrics_summary(worker_metrics):
     }
 
 
-async def run_load_test(scheduler, load_balancer, num_users=1000, max_concurrent=30):
+async def run_load_test(scheduler, load_balancer, num_users=1000, max_concurrent=30, arrival_interval=0.01):
     sem = asyncio.Semaphore(max_concurrent)
-    tasks = [asyncio.create_task(simulate_user(i, scheduler, sem)) for i in range(num_users)]
     results = []
+    tasks = []
     start_time = time.time()
     interrupted = False
 
+    async def _spawn_users():
+        # Stagger task creation so [QUEUE], [OVERLOADED], and [RESPONSE]
+        # interleave naturally instead of bursting all at once.
+        for i in range(num_users):
+            tasks.append(asyncio.create_task(simulate_user(i, scheduler, sem)))
+            if arrival_interval > 0:
+                await asyncio.sleep(arrival_interval)
+
+    spawner = asyncio.create_task(_spawn_users())
+
     try:
+        await spawner
         for task in asyncio.as_completed(tasks):
             results.append(await task)
     except (asyncio.CancelledError, KeyboardInterrupt):
         interrupted = True
+        spawner.cancel()
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(spawner, *tasks, return_exceptions=True)
     finally:
         total_time = time.time() - start_time
+        # Flush any pending [QUEUE] batch so all admissions are visible
+        # before the metrics block.
+        flush = getattr(scheduler, "_flush_queue_log", None)
+        if callable(flush):
+            flush(force=True)
         worker_metrics = await load_balancer.get_worker_metrics_snapshot()
         summary = _print_metrics_summary(results, total_time, worker_metrics, interrupted=interrupted)
 

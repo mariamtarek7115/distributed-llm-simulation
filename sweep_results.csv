@@ -1,0 +1,5 @@
+users,concurrency,completed,success,overloaded,failed,total_time_s,throughput_req_s,avg_latency_s,p95_latency_s,avg_cpu_pct,avg_gpu_pct,strategy,scenario
+100,100,100,54,46,0,30.64,3.26,8.42,27.3,0.0,0.0,round_robin,normal
+250,250,250,54,196,0,34.28,7.29,3.77,25.34,0.0,0.0,round_robin,normal
+500,500,500,54,446,0,29.38,17.02,1.6,15.55,0.0,0.0,round_robin,normal
+1000,1000,1000,54,946,0,30.09,33.23,0.86,3.73,0.0,0.0,round_robin,normal
